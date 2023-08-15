@@ -47,174 +47,6 @@ from utils.io_utils import get_or_create_logger, load_json, save_json
 
 logger = get_or_create_logger(__name__)
 
-def load_dbs(db_path=None, num_examples=None):
-    """load all dbs in all gpus"""
-    dbs = json.loads(open(db_path, 'r', encoding='utf-8').read().lower())
-    if num_examples is not None:
-        dbs = dbs[:num_examples]
-    return dbs
-
-def entity_to_text_wo_dk(entity):
-    text = "<database>"
-    for key, val in entity.items():
-        if val != "dontknow":
-            text += f" {key} {val} <sep_attributes>"
-    return text
-
-def entity_to_text_w_dk_mask(entity, dk_mask=False):
-    text = "<database>"
-    mask = []
-    for key, val in entity.items():
-        text += f" {key} {val} <sep_attributes>"
-        if val == "dontknow":
-            mask.append(0)
-        else:
-            mask.append(1)
-    if dk_mask is True:
-        return text, mask
-    else:
-        return text, None
-
-def padSeqs(sequences, maxlen=None, truncated='max_len', pad_method='post', trunc_method='pre', dtype='int32',
-            value=0.):
-    assert truncated in ['max_len', 'batch_max_len']
-    if not hasattr(sequences, '__len__'):
-        raise ValueError('`sequences` must be iterable.')
-    lengths = []
-    for x in sequences:
-        if not hasattr(x, '__len__'):
-            raise ValueError('`sequences` must be a list of iterables. '
-                             'Found non-iterable: ' + str(x))
-        lengths.append(len(x))
-
-    num_samples = len(sequences)
-    seq_maxlen = np.max(lengths)
-
-    # if maxlen is not None and truncated:
-    #     maxlen = min(seq_maxlen, maxlen)
-    # else:
-    #     maxlen = seq_maxlen
-    if truncated == 'max_len':
-        maxlen = maxlen
-    else:
-        maxlen = min(maxlen, seq_maxlen)
-
-    # take the sample shape from the first non empty sequence
-    # checking for consistency in the main loop below.
-    sample_shape = tuple()
-    for s in sequences:
-        if len(s) > 0:
-            sample_shape = np.asarray(s).shape[1:]
-            break
-
-    x = (np.ones((num_samples, maxlen) + sample_shape) * value).astype(dtype)
-    for idx, s in enumerate(sequences):
-        if not len(s):
-            print('empty list/array was found')
-            continue  # empty list/array was found
-        if trunc_method == 'pre':
-            trunc = s[-maxlen:]
-        elif trunc_method == 'post':
-            trunc = s[:maxlen]
-        else:
-            raise ValueError('Truncating type "%s" not understood' % trunc_method)
-
-        # check `trunc` has expected shape
-        trunc = np.asarray(trunc, dtype=dtype)
-        if trunc.shape[1:] != sample_shape:
-            raise ValueError('Shape of sample %s of sequence at position %s is different from expected shape %s' %
-                             (trunc.shape[1:], idx, sample_shape))
-
-        if pad_method == 'post':
-            x[idx, :len(trunc)] = trunc
-        elif pad_method == 'pre':
-            x[idx, -len(trunc):] = trunc
-        else:
-            raise ValueError('Padding type "%s" not understood' % pad_method)
-    return x
-
-class DBDataset(torch.utils.data.Dataset):
-    """use for database text"""
-
-    def __init__(self, dbs, db_type="entrance", use_dk=False, dk_mask=False):
-        self.dbs = dbs
-        self.db_type = db_type
-        self.use_dk = use_dk
-        self.dk_mask = dk_mask
-
-    def __len__(self):
-        return len(self.dbs)
-
-    def __getitem__(self, index):
-        example = self.dbs[index]
-        if self.db_type == "entrance":
-            if self.use_dk is False:
-                text = entity_to_text_wo_dk(example)
-                return_dict = {"db_index": index, "db_text": text}
-            else:
-                text, mask = entity_to_text_w_dk_mask(example, dk_mask=self.dk_mask)
-                if self.dk_mask is True:
-                    return_dict = {"db_index": index, "db_text": text, "db_mask": mask}
-                else:
-                    return_dict = {"db_index": index, "db_text": text}
-        else:
-            raise ValueError
-        return return_dict
-
-class DBCollator(object):
-    """use for database text"""
-
-    def __init__(self, tokenizer, maxlength, type='generator'):
-        self.tokenizer = tokenizer
-        self.maxlength = maxlength
-        self.pad_id = 0
-        if len(self.tokenizer.encode("<sep_attributes>")) == 1:
-            self.sep_id = self.tokenizer.encode("<sep_attributes>")[0]
-            self.db_id = self.tokenizer.encode("<database>")[0]
-        else:
-            self.sep_id = self.tokenizer.encode("<sep_attributes>")[1]
-            self.db_id = self.tokenizer.encode("<database>")[1]
-        self.type = type
-
-    def __call__(self, batch):
-        index = [x["db_index"] for x in batch]
-        text = [x["db_text"] for x in batch]
-        text = self.tokenizer.batch_encode_plus(text)
-        text_ids = torch.tensor(padSeqs(text['input_ids'],
-                                         maxlen=self.maxlength, truncated='max_len',
-                                         pad_method='post', trunc_method='pre', dtype='int32',
-                                         value=self.pad_id))
-        text_mask = torch.tensor(padSeqs(text['attention_mask'],
-                                         maxlen=self.maxlength, truncated='max_len',
-                                         pad_method='post', trunc_method='pre', dtype='int32',
-                                         value=self.pad_id)).bool()
-        if "db_mask" in batch[0] and self.type == "generator":  # dk_mask only for generator
-            attr_mask = [x["db_mask"] for x in batch]
-            attr_mask = torch.tensor(attr_mask).bool()
-            sep_index = text_ids.eq(self.sep_id).nonzero()
-            db_index = text_ids.eq(self.db_id).nonzero()
-            attr_num = attr_mask.size(1)
-            assert len(sep_index) % attr_num == 0
-            attr_true_mask = torch.ones_like(text_mask).bool()
-            for i, idx in enumerate(sep_index):
-                if i % attr_num == 0:
-                    start_idx = db_index[sep_index[i][0]][1]
-                else:
-                    start_idx = sep_index[i - 1][1] + 1
-                end_idx = sep_index[i][1] + 1
-                attr_true_mask[sep_index[i][0], start_idx: end_idx] = attr_mask[sep_index[i][0], i % attr_num]
-            text_mask = text_mask * attr_true_mask
-        else:
-            attr_mask = None
-        if "token_type_ids" in text:
-            text_token_type = torch.tensor(padSeqs(text['token_type_ids'],
-                                                   maxlen=self.maxlength, truncated='max_len',
-                                                   pad_method='post', trunc_method='pre', dtype='int32',
-                                                   value=1))
-        else:
-            text_token_type = None
-        return index, text_ids, text_mask, text_token_type, attr_mask
-
 class Reporter(object):
     def __init__(self, log_frequency, model_dir):
         self.log_frequency = log_frequency
@@ -336,3 +168,126 @@ class Reporter(object):
             " ".join([common_info, belief_info, resp_info, span_info]))
 
         self.init_stats()
+
+
+class BaseRunner(metaclass=ABCMeta):
+    def __init__(self, cfg, reader):
+        self.cfg = cfg
+        self.reader = reader
+
+        self.model = self.load_model()
+
+    def load_model(self):
+        if self.cfg.ckpt is not None:
+            model_path = self.cfg.ckpt
+            initialize_additional_decoder = False
+        elif self.cfg.train_from is not None:
+            model_path = self.cfg.train_from
+            initialize_additional_decoder = False
+        else:
+            model_path = self.cfg.backbone
+            initialize_additional_decoder = True
+
+        logger.info("Load model from {}".format(model_path))
+
+        if not self.cfg.add_auxiliary_task:
+            model_wrapper = T5WithSpan
+        else:
+            model_wrapper = T5WithTokenSpan
+
+        num_span = len(definitions.EXTRACTIVE_SLOT)
+
+        model = model_wrapper.from_pretrained(model_path, num_span=num_span)
+
+        model.resize_token_embeddings(self.reader.vocab_size)
+
+        if initialize_additional_decoder:
+            model.initialize_additional_decoder()
+        '''
+        if self.cfg.num_gpus > 1:
+            model = torch.nn.DataParallel(model)
+        '''
+        model.to(self.cfg.device)
+
+        return model
+
+    def save_model(self, epoch):
+        latest_ckpt = "ckpt-epoch{}".format(epoch)
+        save_path = os.path.join(self.cfg.model_dir, latest_ckpt)
+        '''
+        if self.cfg.num_gpus > 1:
+            model = self.model.module
+        else:
+            model = self.model
+        '''
+        model = self.model
+
+        model.save_pretrained(save_path)
+
+        # keep chekpoint up to maximum
+        checkpoints = sorted(
+            glob.glob(os.path.join(self.cfg.model_dir, "ckpt-*")),
+            key=os.path.getmtime,
+            reverse=True)
+
+        checkpoints_to_be_deleted = checkpoints[self.cfg.max_to_keep_ckpt:]
+
+        for ckpt in checkpoints_to_be_deleted:
+            shutil.rmtree(ckpt)
+
+        return latest_ckpt
+
+    def get_optimizer_and_scheduler(self, num_traininig_steps_per_epoch, train_batch_size):
+        '''
+        num_train_steps = (num_train_examples *
+            self.cfg.epochs) // (train_batch_size * self.cfg.grad_accum_steps)
+        '''
+        num_train_steps = (num_traininig_steps_per_epoch *
+            self.cfg.epochs) // self.cfg.grad_accum_steps
+
+        if self.cfg.warmup_steps >= 0:
+            num_warmup_steps = self.cfg.warmup_steps
+        else:
+            #num_warmup_steps = int(num_train_steps * 0.2)
+            num_warmup_steps = int(num_train_steps * self.cfg.warmup_ratio)
+
+        logger.info("Total training steps = {}, warmup steps = {}".format(
+            num_train_steps, num_warmup_steps))
+
+        optimizer = AdamW(self.model.parameters(), lr=self.cfg.learning_rate)
+
+        if self.cfg.no_learning_rate_decay:
+            scheduler = get_constant_schedule(optimizer)
+        else:
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_train_steps)
+
+        return optimizer, scheduler
+
+    def count_tokens(self, pred, label, pad_id):
+        pred = pred.view(-1)
+        label = label.view(-1)
+
+        num_count = label.ne(pad_id).long().sum()
+        num_correct = torch.eq(pred, label).long().sum()
+
+        return num_correct, num_count
+
+    def count_spans(self, pred, label):
+        pred = pred.view(-1, 2)
+
+        num_count = label.ne(-1).long().sum()
+        num_correct = torch.eq(pred, label).long().sum()
+
+        return num_correct, num_count
+
+    @abstractmethod
+    def train(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def predict(self):
+        raise NotImplementedError
+
